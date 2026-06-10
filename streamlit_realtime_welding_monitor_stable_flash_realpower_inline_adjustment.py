@@ -169,6 +169,82 @@ html, body, [class*="css"] {
     background: #fffafa;
 }
 
+.kpi-row-card {
+    background: #ffffff;
+    border: 1px solid #d0d5dd;
+    border-radius: 16px;
+    padding: 8px 0;
+    margin: 12px 0 18px 0;
+    box-shadow: 0 1px 3px rgba(16,24,40,0.04);
+}
+
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.kpi-cell {
+    padding: 0 24px;
+    min-height: 80px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+.kpi-cell + .kpi-cell {
+    position: relative;
+}
+
+.kpi-cell + .kpi-cell::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    border-radius: 999px;
+    background: #8a8a8a;
+    transform: translateX(-3px);
+}
+
+.kpi-label {
+    color: #111827;
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1.3;
+    margin-bottom: 9px;
+}
+
+.kpi-value {
+    color: #111827;
+    font-size: 24px;
+    font-weight: 600;
+    line-height: 1.15;
+    word-break: keep-all;
+}
+
+.kpi-value.alert {
+    color: #d92d20;
+    font-weight: 700;
+}
+
+@media (max-width: 900px) {
+    .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        row-gap: 14px;
+    }
+
+    .kpi-cell:nth-child(3) {
+        position: relative;
+    }
+
+    .kpi-cell:nth-child(3)::before {
+        display: none;
+    }
+}
+
 
 
 div.stButton > button {
@@ -1096,6 +1172,30 @@ RECIPE_DEFECT_LABEL = "\ubd88\ub7c9"
 RECIPE_TOTAL_LABEL = "\ud569\uacc4"
 RECIPE_RATE_LABEL = "\ube44\uc728"
 RECIPE_FIELD_COLUMNS = ["Speed", "Length", "SetPower", "SetFrequency", "SetDuty", "GateOnTime", "RealPower"]
+TRAIN_RECIPE_COLUMNS = ["Speed", "Length", "SetFrequency", "SetDuty", "SetPower"]
+
+
+def make_kpi_row_html(items: list[dict]) -> str:
+    cells = []
+    for item in items:
+        label = html.escape(str(item.get("label", "")))
+        value = html.escape(str(item.get("value", "")))
+        tone = str(item.get("tone", "")).strip()
+        value_class = "kpi-value alert" if tone == "alert" else "kpi-value"
+        cells.append(
+            f'<div class="kpi-cell">'
+            f'<div class="kpi-label">{label}</div>'
+            f'<div class="{value_class}">{value}</div>'
+            f'</div>'
+        )
+
+    return (
+        '<div class="kpi-row-card">'
+        '<div class="kpi-grid">'
+        f'{"".join(cells)}'
+        '</div>'
+        '</div>'
+    )
 
 
 def estimate_monitor_refresh_seconds(
@@ -1133,6 +1233,172 @@ def estimate_monitor_refresh_seconds(
         estimated_seconds = float(np.median(np.minimum(diff_values, max_interval_seconds)))
 
     return min(max_interval_seconds, max(min_seconds, estimated_seconds))
+
+
+def add_detected_cycle_column(df: pd.DataFrame, cycle_col: str = "_detected_cycle") -> pd.DataFrame:
+    result = df.copy()
+    if result is None or len(result) == 0:
+        result[cycle_col] = []
+        return result
+
+    if "PageNo" in result.columns:
+        page_values = pd.to_numeric(result["PageNo"], errors="coerce")
+        cycle_start = page_values.eq(1)
+        if len(cycle_start) > 0:
+            cycle_start.iloc[0] = True
+        result[cycle_col] = cycle_start.cumsum().astype(int)
+        return result
+
+    if "cycle_id" in result.columns:
+        cycle_values = pd.to_numeric(result["cycle_id"], errors="coerce")
+        result[cycle_col] = cycle_values.fillna(method="ffill").fillna(1).astype(int)
+        return result
+
+    result[cycle_col] = ((np.arange(len(result)) // 39) + 1).astype(int)
+    return result
+
+
+def get_completed_cycle_ids(cycle_df: pd.DataFrame, cycle_col: str = "_detected_cycle") -> list[int]:
+    if cycle_df is None or len(cycle_df) == 0 or cycle_col not in cycle_df.columns:
+        return []
+
+    all_cycle_ids = sorted(pd.to_numeric(cycle_df[cycle_col], errors="coerce").dropna().astype(int).unique().tolist())
+    if "PageNo" not in cycle_df.columns:
+        return all_cycle_ids
+
+    page_values = pd.to_numeric(cycle_df["PageNo"], errors="coerce")
+    completed_mask = page_values.eq(39)
+    completed_ids = sorted(
+        pd.to_numeric(cycle_df.loc[completed_mask, cycle_col], errors="coerce")
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+    return completed_ids if completed_ids else all_cycle_ids
+
+
+def format_seconds_for_metric(seconds_value) -> str:
+    if seconds_value is None or pd.isna(seconds_value) or not np.isfinite(float(seconds_value)):
+        return "-"
+
+    seconds_value = float(seconds_value)
+    if seconds_value < 60:
+        return f"{seconds_value:.2f}초"
+
+    minutes = int(seconds_value // 60)
+    seconds = seconds_value % 60
+    return f"{minutes}분 {seconds:.1f}초"
+
+
+def build_train_dataset_kpis(train_df: pd.DataFrame) -> dict:
+    cycle_df = add_detected_cycle_column(train_df)
+    cycle_col = "_detected_cycle"
+    completed_cycle_ids = get_completed_cycle_ids(cycle_df, cycle_col=cycle_col)
+    selected_cycle_df = cycle_df[cycle_df[cycle_col].isin(completed_cycle_ids)].copy()
+
+    total_cycles = int(len(completed_cycle_ids))
+    welds_per_cycle = (
+        float(selected_cycle_df.groupby(cycle_col).size().mean())
+        if len(selected_cycle_df) and total_cycles
+        else np.nan
+    )
+
+    avg_cycle_seconds = np.nan
+    if len(selected_cycle_df) and "WorkingTime" in selected_cycle_df.columns:
+        time_df = selected_cycle_df.copy()
+        time_df["WorkingTime"] = pd.to_datetime(time_df["WorkingTime"], errors="coerce")
+        cycle_times = (
+            time_df.dropna(subset=["WorkingTime"])
+            .groupby(cycle_col)["WorkingTime"]
+            .agg(lambda values: (values.max() - values.min()).total_seconds())
+        )
+        cycle_times = cycle_times[cycle_times >= 0]
+        if len(cycle_times):
+            avg_cycle_seconds = float(cycle_times.mean())
+
+    avg_daily_production = np.nan
+    if len(selected_cycle_df) and "WorkingTime" in selected_cycle_df.columns:
+        time_df = selected_cycle_df.copy()
+        time_df["WorkingTime"] = pd.to_datetime(time_df["WorkingTime"], errors="coerce")
+        if "PageNo" in time_df.columns:
+            page_values = pd.to_numeric(time_df["PageNo"], errors="coerce")
+            completion_df = time_df[page_values.eq(39)].copy()
+        else:
+            completion_df = pd.DataFrame()
+
+        if len(completion_df) == 0:
+            completion_df = (
+                time_df.dropna(subset=["WorkingTime"])
+                .sort_values("WorkingTime")
+                .groupby(cycle_col, as_index=False)
+                .tail(1)
+            )
+
+        if len(completion_df):
+            daily_counts = completion_df.dropna(subset=["WorkingTime"]).groupby(completion_df["WorkingTime"].dt.date).size()
+            if len(daily_counts):
+                avg_daily_production = float(daily_counts.mean())
+
+    return {
+        "daily_average": avg_daily_production,
+        "avg_cycle_seconds": avg_cycle_seconds,
+        "total_cycles": total_cycles,
+        "welds_per_cycle": welds_per_cycle,
+    }
+
+
+def build_train_recipe_summary(train_df: pd.DataFrame) -> pd.DataFrame:
+    recipe_cols = [col for col in TRAIN_RECIPE_COLUMNS if col in train_df.columns]
+    if train_df is None or len(train_df) == 0 or not recipe_cols:
+        return pd.DataFrame()
+
+    recipe_df = train_df[recipe_cols].copy()
+    for col in recipe_cols:
+        numeric_values = pd.to_numeric(recipe_df[col], errors="coerce")
+        if numeric_values.notna().any():
+            recipe_df[col] = numeric_values
+        else:
+            recipe_df[col] = recipe_df[col].fillna("").astype(str)
+
+    summary_df = recipe_df.groupby(recipe_cols, dropna=False).size().reset_index(name="행수")
+    total_rows = max(1, int(summary_df["행수"].sum()))
+    summary_df["비율(%)"] = (summary_df["행수"] / total_rows * 100).round(2)
+
+    sort_cols = []
+    ascending = []
+    if "SetPower" in summary_df.columns:
+        sort_cols.append("SetPower")
+        ascending.append(False)
+    for col in recipe_cols:
+        if col not in sort_cols:
+            sort_cols.append(col)
+            ascending.append(True)
+
+    return summary_df.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
+
+
+def build_pageno_realpower_stats(train_df: pd.DataFrame) -> pd.DataFrame:
+    if train_df is None or len(train_df) == 0 or "PageNo" not in train_df.columns or "RealPower" not in train_df.columns:
+        return pd.DataFrame()
+
+    stats_df = train_df[["PageNo", "RealPower"]].copy()
+    stats_df["PageNo"] = pd.to_numeric(stats_df["PageNo"], errors="coerce")
+    stats_df["RealPower"] = pd.to_numeric(stats_df["RealPower"], errors="coerce")
+    stats_df = stats_df.dropna(subset=["PageNo", "RealPower"])
+    if len(stats_df) == 0:
+        return pd.DataFrame()
+
+    result_df = (
+        stats_df.groupby("PageNo")["RealPower"]
+        .agg(**{"RealPower 평균": "mean", "RealPower 표준편차": "std"})
+        .reset_index()
+        .sort_values("PageNo")
+    )
+    result_df["PageNo"] = result_df["PageNo"].astype(int)
+    result_df["RealPower 평균"] = result_df["RealPower 평균"].round(2)
+    result_df["RealPower 표준편차"] = result_df["RealPower 표준편차"].fillna(0).round(2)
+    return result_df
 
 
 
@@ -1895,11 +2161,15 @@ def render_monitor_content(current_idx: int):
     daily_defect_count = int((current_day_df["pred_label"] == 1).sum()) if len(current_day_df) > 0 else 0
     cumulative_defect_rate = defect_count / len(seen_df) if len(seen_df) > 0 else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("현재 판정", "불량" if latest_alarm else "정상")
-    c2.metric("누적 불량률", f"{cumulative_defect_rate * 100:.2f}%")
-    c3.metric("일별 생산량", f"{daily_prod_count:,} 개")
-    c4.metric("일별 불량", f"{daily_defect_count:,} point")
+    st.markdown(
+        make_kpi_row_html([
+            {"label": "현재 판정", "value": "불량" if latest_alarm else "정상", "tone": "alert" if latest_alarm else ""},
+            {"label": "누적 불량률", "value": f"{cumulative_defect_rate * 100:.2f}%"},
+            {"label": "일별 생산량", "value": f"{daily_prod_count:,} 개"},
+            {"label": "일별 불량", "value": f"{daily_defect_count:,} point"},
+        ]),
+        unsafe_allow_html=True,
+    )
 
     # -----------------------------------------------------
     # 그래프
@@ -2025,11 +2295,15 @@ def render_daily_log_content(current_idx: int):
         else 0
     )
 
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("조회 날짜", str(selected_date))
-    d2.metric("일별 생산량", f"{selected_daily_prod:,} 개")
-    d3.metric("일별 불량", f"{selected_daily_defect:,} point")
-    d4.metric("일별 불량률", f"{selected_daily_defect_rate * 100:.2f}%")
+    st.markdown(
+        make_kpi_row_html([
+            {"label": "조회 날짜", "value": str(selected_date)},
+            {"label": "일별 생산량", "value": f"{selected_daily_prod:,} 개"},
+            {"label": "일별 불량", "value": f"{selected_daily_defect:,} point"},
+            {"label": "일별 불량률", "value": f"{selected_daily_defect_rate * 100:.2f}%"},
+        ]),
+        unsafe_allow_html=True,
+    )
 
     daily_cols = [
         "WorkingTime",
@@ -2074,7 +2348,7 @@ def render_daily_log_content(current_idx: int):
         height=420,
     )
 
-    st.markdown("#### 레시피 조합 (Speed, Length, SetPower, SetFrequency, SetDuty, GateOnTime, RealPower)")
+    st.markdown("#### 레시피 조합")
     recipe_count_df = build_recipe_combination_count_df(selected_daily_df)
 
     if len(recipe_count_df) == 0:
@@ -2083,6 +2357,51 @@ def render_daily_log_content(current_idx: int):
         st.markdown(
             make_recipe_combination_count_html(recipe_count_df),
             unsafe_allow_html=True,
+        )
+
+
+def render_train_dataset_tab():
+    st.markdown("### 데이터 현황")
+
+    if train is None or len(train) == 0:
+        st.info("표시할 train 데이터가 없습니다.")
+        return
+
+    kpis = build_train_dataset_kpis(train)
+    st.markdown(
+        make_kpi_row_html([
+            {"label": "하루평균생산량", "value": f"{kpis['daily_average']:.1f}개" if pd.notna(kpis["daily_average"]) else "-"},
+            {"label": "제품당 평균 생산 시간", "value": format_seconds_for_metric(kpis["avg_cycle_seconds"])},
+            {"label": "총 생산량", "value": f"{kpis['total_cycles']:,}개"},
+            {"label": "제품당 용접 횟수", "value": f"{int(kpis['welds_per_cycle']):,}회" if pd.notna(kpis["welds_per_cycle"]) else "-"},
+        ]),
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### 레시피 종류")
+    recipe_summary_df = build_train_recipe_summary(train)
+    if len(recipe_summary_df) == 0:
+        st.info("표시할 레시피 데이터가 없습니다.")
+    else:
+        recipe_table_height = min(320, max(150, 48 + len(recipe_summary_df) * 35))
+        st.caption(f"레시피 갯수: {len(recipe_summary_df):,}개")
+        st.dataframe(
+            recipe_summary_df,
+            use_container_width=True,
+            hide_index=True,
+            height=recipe_table_height,
+        )
+
+    st.markdown("#### PageNo별 RealPower 평균, 표준편차")
+    page_stats_df = build_pageno_realpower_stats(train)
+    if len(page_stats_df) == 0:
+        st.info("표시할 PageNo별 RealPower 통계가 없습니다.")
+    else:
+        st.dataframe(
+            page_stats_df,
+            use_container_width=True,
+            hide_index=True,
+            height=420,
         )
 
 
@@ -2343,9 +2662,10 @@ def smooth_daily_log_fragment():
 # =========================================================
 # 탭 구성
 # =========================================================
-tab_monitor, tab_daily_log, tab_defect_model, tab_model_history = st.tabs([
+tab_monitor, tab_daily_log, tab_train_dataset, tab_defect_model, tab_model_history = st.tabs([
     "실시간 모니터링",
     "일별 로그",
+    "데이터 현황",
     "불량 판정 모델",
     "모델 학습 기록",
 ])
@@ -2355,6 +2675,9 @@ with tab_monitor:
 
 with tab_daily_log:
     smooth_daily_log_fragment()
+
+with tab_train_dataset:
+    render_train_dataset_tab()
 
 with tab_defect_model:
     render_defect_model_tab()
