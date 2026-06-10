@@ -6,7 +6,9 @@
 # - OK1, OK2, NG1, NG2 데이터를 하나의 스트림처럼 연결
 # =========================================================
 
+import base64
 import html
+import json
 import time
 from pathlib import Path
 
@@ -245,6 +247,56 @@ html, body, [class*="css"] {
     }
 }
 
+html,
+body,
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stSidebarContent"],
+[data-testid="stVerticalBlock"] {
+    overflow-anchor: auto;
+}
+
+div[data-testid="stElementContainer"]:has(.defect-flash-slot),
+div[data-testid="stMarkdownContainer"]:has(.defect-flash-slot) {
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    overflow-anchor: none;
+}
+
+.defect-flash-slot {
+    position: fixed;
+    inset: 0;
+    width: 0;
+    height: 0;
+    z-index: 2147483647;
+    pointer-events: none;
+    overflow: visible;
+    overflow-anchor: none;
+}
+
+@keyframes defectFlashOneBlink {
+    0%   { opacity: 0; }
+    32%  { opacity: 0.68; }
+    58%  { opacity: 0.68; }
+    100% { opacity: 0; }
+}
+
+.defect-flash-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(185, 28, 28, 0.62);
+    z-index: 2147483647;
+    pointer-events: none;
+    opacity: 0;
+    animation: defectFlashOneBlink 0.42s ease-in-out 3 forwards;
+    will-change: opacity;
+    contain: paint;
+}
+
 
 
 div.stButton > button {
@@ -260,73 +312,187 @@ div.stButton > button {
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
-def make_flash_overlay_html(flash_id: int) -> str:
+def make_flash_overlay_html(flash_id=None, alarm_audio_data_url: str = "", alarm_volume: float = 0.7) -> str:
     """
-    불량 발생 시 화면 전체를 짧고 부드럽게 강조하는 안정화 버전.
+    불량 발생 시 화면 전체를 정확히 3번 진하게 강조하는 scroll-safe 버전.
 
     핵심:
-    - Streamlit fragment 내부에 overlay를 넣지 않는다.
-    - components.html의 JavaScript를 이용해 브라우저 parent document body에 overlay를 직접 붙인다.
-    - overlay는 animationend 또는 안전 타이머로 자동 제거된다.
-    - 연속 불량에서는 Python 쪽 쿨다운으로 overlay가 과도하게 중첩되지 않는다.
+    - fragment 내부 DOM이 갱신되어도 animation이 끊기지 않도록 parent document에 overlay를 붙인다.
+    - 이 component는 항상 같은 위치에서 실행되므로 불량 순간마다 레이아웃 요소를 새로 끼워 넣지 않는다.
+    - overlay는 fixed 요소라 문서 높이와 카드/차트 배치를 밀지 않는다.
+    - CSS animation iteration을 3으로 고정해 정확히 3번만 깜빡인다.
+    - Python 쪽 lock 시간 동안 들어온 불량은 flash 트리거만 무시한다.
     """
+    flash_id_js = "null" if flash_id is None else str(int(flash_id))
+    audio_data_url_js = json.dumps(alarm_audio_data_url or "")
+    alarm_volume_value = max(0.0, min(1.0, float(alarm_volume)))
     return f"""
+    <div class="defect-flash-slot" aria-hidden="true"></div>
     <script>
     (function() {{
-        const doc = window.parent.document;
-        const overlayId = 'defect-flash-overlay-{flash_id}';
+        const win = window.parent;
+        const doc = win.document;
+        const flashId = {flash_id_js};
+        const totalSeconds = (0.42 * 3) + 0.15;
+        const totalMs = totalSeconds * 1000;
+        const audioDataUrl = {audio_data_url_js};
+        const alarmVolume = {alarm_volume_value:.4f};
 
-        if (doc.getElementById(overlayId)) {{
-            return;
-        }}
-
-        const styleId = 'defect-flash-style';
-        let style = doc.getElementById(styleId);
-
-        if (!style) {{
-            style = doc.createElement('style');
+        const styleId = 'defect-flash-style-triple';
+        if (!doc.getElementById(styleId)) {{
+            const style = doc.createElement('style');
             style.id = styleId;
             style.innerHTML = `
-                @keyframes defectFlashStable {{
+                @keyframes defectFlashOneBlink {{
                     0%   {{ opacity: 0; }}
-                    10%  {{ opacity: 0.34; }}
-                    28%  {{ opacity: 0; }}
-                    46%  {{ opacity: 0.26; }}
-                    64%  {{ opacity: 0; }}
+                    32%  {{ opacity: 0.68; }}
+                    58%  {{ opacity: 0.68; }}
                     100% {{ opacity: 0; }}
                 }}
 
                 .defect-flash-overlay {{
                     position: fixed;
                     inset: 0;
-                    background: rgba(255, 59, 48, 0.30);
+                    background: rgba(185, 28, 28, 0.62);
                     z-index: 2147483647;
                     pointer-events: none;
                     opacity: 0;
-                    animation: defectFlashStable 1.15s ease-out 1;
+                    animation: defectFlashOneBlink 0.42s ease-in-out 3 forwards;
                     will-change: opacity;
                     contain: paint;
+                    overflow-anchor: none;
                 }}
             `;
             doc.head.appendChild(style);
         }}
 
-        const overlay = doc.createElement('div');
-        overlay.id = overlayId;
-        overlay.className = 'defect-flash-overlay';
-        overlay.setAttribute('data-flash-id', '{flash_id}');
+        if (flashId === null) {{
+            return;
+        }}
 
+        if (win.__weldingDefectFlashLastStartedId === flashId) {{
+            return;
+        }}
+
+        win.__weldingDefectFlashLastStartedId = flashId;
+
+        const existing = doc.getElementById('defect-flash-overlay-active');
+        if (existing) {{
+            existing.remove();
+        }}
+
+        const overlay = doc.createElement('div');
+        overlay.id = 'defect-flash-overlay-active';
+        overlay.className = 'defect-flash-overlay';
+        overlay.setAttribute('data-flash-id', String(flashId));
         doc.body.appendChild(overlay);
+
+        async function playAlarmSound() {{
+            if (!audioDataUrl || alarmVolume <= 0) {{
+                return;
+            }}
+
+            const volume = Math.max(0, Math.min(1, alarmVolume));
+
+            try {{
+                if (win.__weldingDefectAlarmAudio) {{
+                    win.__weldingDefectAlarmAudio.pause();
+                    win.__weldingDefectAlarmAudio.currentTime = 0;
+                    win.__weldingDefectAlarmAudio = null;
+                }}
+
+                if (win.__weldingDefectAlarmSource) {{
+                    try {{
+                        win.__weldingDefectAlarmSource.stop(0);
+                    }} catch (error) {{}}
+                    win.__weldingDefectAlarmSource = null;
+                }}
+
+                const AudioContextClass = win.AudioContext || win.webkitAudioContext;
+                if (AudioContextClass) {{
+                    const ctx = win.__weldingDefectAudioContext || new AudioContextClass();
+                    win.__weldingDefectAudioContext = ctx;
+
+                    if (ctx.state === 'suspended') {{
+                        await ctx.resume();
+                    }}
+
+                    if (!win.__weldingDefectAlarmBuffer || win.__weldingDefectAlarmBufferUrl !== audioDataUrl) {{
+                        const response = await fetch(audioDataUrl);
+                        const arrayBuffer = await response.arrayBuffer();
+                        win.__weldingDefectAlarmBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+                        win.__weldingDefectAlarmBufferUrl = audioDataUrl;
+                    }}
+
+                    const source = ctx.createBufferSource();
+                    const gain = ctx.createGain();
+                    source.buffer = win.__weldingDefectAlarmBuffer;
+                    gain.gain.value = volume;
+                    source.connect(gain);
+                    gain.connect(ctx.destination);
+
+                    win.__weldingDefectAlarmSource = source;
+                    win.__weldingDefectAlarmGain = gain;
+
+                    source.start(0, 0);
+                    source.stop(ctx.currentTime + totalSeconds);
+
+                    win.setTimeout(function() {{
+                        try {{
+                            source.stop(0);
+                        }} catch (error) {{}}
+                        try {{
+                            source.disconnect();
+                            gain.disconnect();
+                        }} catch (error) {{}}
+                        if (win.__weldingDefectAlarmSource === source) {{
+                            win.__weldingDefectAlarmSource = null;
+                        }}
+                    }}, totalMs + 120);
+                    return;
+                }}
+
+                const audio = new win.Audio(audioDataUrl);
+                audio.volume = volume;
+                audio.currentTime = 0;
+                win.__weldingDefectAlarmAudio = audio;
+
+                audio.addEventListener('timeupdate', function() {{
+                    if (audio.currentTime >= totalSeconds) {{
+                        audio.pause();
+                        try {{
+                            audio.currentTime = 0;
+                        }} catch (error) {{}}
+                    }}
+                }});
+
+                const playPromise = audio.play();
+                if (playPromise && typeof playPromise.catch === 'function') {{
+                    playPromise.catch(function() {{}});
+                }}
+
+                win.setTimeout(function() {{
+                    if (audio && !audio.paused) {{
+                        audio.pause();
+                    }}
+                    try {{
+                        audio.currentTime = 0;
+                    }} catch (error) {{}}
+                }}, totalMs);
+            }} catch (error) {{}}
+        }}
+
+        playAlarmSound();
 
         overlay.addEventListener('animationend', function() {{
             overlay.remove();
         }}, {{ once: true }});
 
-        window.setTimeout(function() {{
+        win.setTimeout(function() {{
             if (overlay && overlay.isConnected) {{
                 overlay.remove();
             }}
-        }}, 1800);
+        }}, totalMs + 350);
     }})();
     </script>
     """
@@ -342,40 +508,103 @@ def make_scroll_position_guard_html(render_id: int, enabled: bool) -> str:
         const key = 'welding-monitor-scroll-y';
         const enabled = {enabled_text};
 
+        function getScroller() {{
+            const main = doc.querySelector('[data-testid="stMain"]');
+            if (main && main.scrollHeight > main.clientHeight) {{
+                return main;
+            }}
+            return doc.scrollingElement || doc.documentElement || doc.body;
+        }}
+
         function getY() {{
-            return win.scrollY || doc.documentElement.scrollTop || doc.body.scrollTop || 0;
+            const scroller = getScroller();
+            if (!scroller) {{
+                return 0;
+            }}
+            return scroller.scrollTop || win.scrollY || doc.documentElement.scrollTop || doc.body.scrollTop || 0;
         }}
 
         function setY(y) {{
+            const scroller = getScroller();
+            if (scroller && typeof scroller.scrollTo === 'function') {{
+                scroller.scrollTo({{ top: y, left: 0, behavior: 'auto' }});
+            }} else if (scroller) {{
+                scroller.scrollTop = y;
+            }}
             win.scrollTo({{ top: y, left: 0, behavior: 'auto' }});
+        }}
+
+        function saveY(y) {{
+            if (y > 10) {{
+                win.__weldingScrollSavedY = y;
+                try {{
+                    win.sessionStorage.setItem(key, String(y));
+                }} catch (error) {{}}
+            }}
+        }}
+
+        function loadY() {{
+            const memoryY = Number(win.__weldingScrollSavedY || 0);
+            if (memoryY > 10) {{
+                return memoryY;
+            }}
+            try {{
+                return Number(win.sessionStorage.getItem(key) || 0);
+            }} catch (error) {{
+                return 0;
+            }}
+        }}
+
+        function restoreIfNeeded(savedY) {{
+            if (savedY > 10 && getY() < 10) {{
+                setY(savedY);
+            }}
         }}
 
         if (!win.__weldingScrollGuardInstalled) {{
             win.__weldingScrollGuardInstalled = true;
-            win.addEventListener('scroll', function() {{
-                const y = getY();
-                if (y > 10) {{
-                    win.sessionStorage.setItem(key, String(y));
+
+            function bindScroller() {{
+                const scroller = getScroller();
+                if (!scroller || win.__weldingScrollGuardScroller === scroller) {{
+                    return;
                 }}
+
+                if (win.__weldingScrollGuardScroller && win.__weldingScrollGuardHandler) {{
+                    win.__weldingScrollGuardScroller.removeEventListener('scroll', win.__weldingScrollGuardHandler);
+                }}
+
+                win.__weldingScrollGuardScroller = scroller;
+                win.__weldingScrollGuardHandler = function() {{
+                    saveY(getY());
+                }};
+                scroller.addEventListener('scroll', win.__weldingScrollGuardHandler, {{ passive: true }});
+            }}
+
+            win.__weldingScrollGuardBindScroller = bindScroller;
+            bindScroller();
+            win.addEventListener('scroll', function() {{
+                saveY(getY());
             }}, {{ passive: true }});
+            win.setInterval(bindScroller, 800);
+        }}
+
+        if (typeof win.__weldingScrollGuardBindScroller === 'function') {{
+            win.__weldingScrollGuardBindScroller();
         }}
 
         const currentY = getY();
-        if (currentY > 10) {{
-            win.sessionStorage.setItem(key, String(currentY));
-        }}
+        saveY(currentY);
 
         if (!enabled) {{
             return;
         }}
 
-        const savedY = Number(win.sessionStorage.getItem(key) || 0);
+        const savedY = loadY();
         if (savedY > 10 && getY() < 10) {{
-            [0, 40, 120, 260, 520].forEach(function(delay) {{
+            [0, 40, 120, 260, 520, 900].forEach(function(delay) {{
                 win.setTimeout(function() {{
-                    if (getY() < 10) {{
-                        setY(savedY);
-                    }}
+                    restoreIfNeeded(savedY);
                 }}, delay);
             }});
         }}
@@ -1157,7 +1386,9 @@ def get_workingtime_delay_seconds(
 
 
 MIN_MONITOR_RENDER_SECONDS = 0.45
-DEFECT_FLASH_COOLDOWN_SECONDS = 2.0
+DEFECT_FLASH_BLINK_SECONDS = 0.42
+DEFECT_FLASH_BLINK_COUNT = 3
+DEFECT_FLASH_LOCK_SECONDS = (DEFECT_FLASH_BLINK_SECONDS * DEFECT_FLASH_BLINK_COUNT) + 0.15
 LOG_HIDDEN_COLUMNS = [
     "dataset",
     "order",
@@ -1173,6 +1404,19 @@ RECIPE_TOTAL_LABEL = "\ud569\uacc4"
 RECIPE_RATE_LABEL = "\ube44\uc728"
 RECIPE_FIELD_COLUMNS = ["Speed", "Length", "SetPower", "SetFrequency", "SetDuty", "GateOnTime", "RealPower"]
 TRAIN_RECIPE_COLUMNS = ["Speed", "Length", "SetFrequency", "SetDuty", "SetPower"]
+ALARM_SOUND_FILENAME = "freesound_community-046570_alarmclockbeepsaif-77772.mp3"
+ALARM_SOUND_CANDIDATES = [
+    Path(__file__).parent / ALARM_SOUND_FILENAME,
+    Path(r"C:\Users\82105\Downloads") / ALARM_SOUND_FILENAME,
+]
+
+
+def load_alarm_audio_data_url() -> str:
+    for path in ALARM_SOUND_CANDIDATES:
+        if path.exists():
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            return f"data:audio/mpeg;base64,{encoded}"
+    return ""
 
 
 def make_kpi_row_html(items: list[dict]) -> str:
@@ -1846,6 +2090,15 @@ sleep_sec = st.sidebar.slider(
     help="WorkingTime 간격 사용 옵션을 끄면 이 간격으로 재생됩니다."
 )
 
+alarm_volume_percent = st.sidebar.slider(
+    "불량 알림 소리 볼륨",
+    0,
+    100,
+    70,
+    5,
+    help="불량 플래시가 시작될 때 재생되는 알림음 볼륨입니다. 0은 음소거입니다."
+)
+
 target_qty = st.sidebar.number_input(
     "목표 생산량",
     min_value=1,
@@ -1921,6 +2174,8 @@ if "last_flash_idx" not in st.session_state:
     st.session_state.last_flash_idx = -1
 if "last_flash_time" not in st.session_state:
     st.session_state.last_flash_time = 0.0
+if "flash_locked_until" not in st.session_state:
+    st.session_state.flash_locked_until = 0.0
 if "last_defect_event_key" not in st.session_state:
     st.session_state.last_defect_event_key = None
 
@@ -1948,6 +2203,7 @@ elif st.session_state.data_signature_light != data_signature_light:
     st.session_state.prev_idx_light = st.session_state.idx_light
     st.session_state.last_flash_idx = -1
     st.session_state.last_flash_time = 0.0
+    st.session_state.flash_locked_until = 0.0
     st.session_state.last_defect_event_key = None
     st.session_state.data_signature_light = data_signature_light
 
@@ -1974,6 +2230,7 @@ if reset_clicked:
     st.session_state.is_running_light = False
     st.session_state.last_flash_idx = -1
     st.session_state.last_flash_time = 0.0
+    st.session_state.flash_locked_until = 0.0
     st.session_state.last_defect_event_key = None
     st.session_state.prev_idx_light = 0
     st.session_state.flash_event_id = 0
@@ -2002,13 +2259,6 @@ monitor_refresh_seconds = estimate_monitor_refresh_seconds(
 )
 monitor_run_every = monitor_refresh_seconds if st.session_state.is_running_light else None
 daily_log_run_every = max(3.0, monitor_refresh_seconds * 2) if st.session_state.is_running_light else None
-
-components.html(
-    make_scroll_position_guard_html(0, st.session_state.is_running_light),
-    height=0,
-    scrolling=False,
-)
-
 
 # =========================================================
 # Fragment 사용 시 주의
@@ -2066,6 +2316,7 @@ def render_monitor_content(current_idx: int):
     new_rows = test_all.iloc[prev_idx:current_idx]
     new_defect_rows = new_rows[new_rows["pred_label"] == 1]
     new_defect_detected = len(new_defect_rows) > 0
+    flash_id_to_render = None
 
     # 불량이 새로 발생할 때만 flash하되, 연속 불량에서는 과도한 overlay 생성을 막습니다.
     if new_defect_detected:
@@ -2075,24 +2326,32 @@ def render_monitor_content(current_idx: int):
             defect_event_key = current_idx
 
         now = time.time()
-        last_flash_time = float(st.session_state.get("last_flash_time", 0.0))
+        flash_locked_until = float(st.session_state.get("flash_locked_until", 0.0))
         is_new_event = st.session_state.get("last_defect_event_key") != defect_event_key
-        can_flash = (now - last_flash_time) >= DEFECT_FLASH_COOLDOWN_SECONDS
+        can_flash = now >= flash_locked_until
 
         if is_new_event and can_flash:
             st.session_state.flash_event_id += 1
-            components.html(
-                make_flash_overlay_html(st.session_state.flash_event_id),
-                height=0,
-                scrolling=False,
-            )
+            flash_id_to_render = st.session_state.flash_event_id
             st.session_state.last_flash_idx = current_idx
             st.session_state.last_flash_time = now
+            st.session_state.flash_locked_until = now + DEFECT_FLASH_LOCK_SECONDS
 
         if is_new_event:
             st.session_state.last_defect_event_key = defect_event_key
 
     st.session_state.prev_idx_light = current_idx
+    if flash_id_to_render is not None:
+        alarm_audio_data_url = load_alarm_audio_data_url() if alarm_volume_percent > 0 else ""
+        components.html(
+            make_flash_overlay_html(
+                flash_id_to_render,
+                alarm_audio_data_url=alarm_audio_data_url,
+                alarm_volume=alarm_volume_percent / 100.0,
+            ),
+            height=0,
+            scrolling=False,
+        )
 
     # -----------------------------------------------------
     # 상태 배너
@@ -2219,7 +2478,7 @@ def render_monitor_content(current_idx: int):
     ]
     cols = [c for c in cols if c in seen_df.columns]
 
-    recent_log_df = seen_df.tail(8)[cols].copy()
+    recent_log_df = seen_df.tail(8).iloc[::-1][cols].reset_index(drop=True).copy()
 
     if "RealPower" in recent_log_df.columns:
         recent_log_df["RealPower"] = recent_log_df.apply(format_realpower_with_adjustment, axis=1)
@@ -2571,6 +2830,8 @@ def render_defect_model_tab():
         st.session_state.idx_light = 0
         st.session_state.prev_idx_light = 0
         st.session_state.last_flash_idx = -1
+        st.session_state.last_flash_time = 0.0
+        st.session_state.flash_locked_until = 0.0
         st.session_state.last_defect_event_key = None
         st.success("학습된 모델을 실시간 모니터링에 적용했습니다.")
         st.rerun()
@@ -2639,11 +2900,6 @@ def smooth_monitor_fragment():
             st.session_state.is_running_light = False
 
     render_monitor_content(st.session_state.idx_light)
-    components.html(
-        make_scroll_position_guard_html(st.session_state.idx_light, st.session_state.is_running_light),
-        height=0,
-        scrolling=False,
-    )
 
     if not st.session_state.is_running_light and st.session_state.idx_light >= len(test_all):
         st.success("재생이 종료되었습니다.")
