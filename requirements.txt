@@ -1,6 +1,7 @@
-streamlit
-pandas
+streamlit==1.51.0
+pandas==2.2.3
 numpy==1.26.4
-plotly
-scikit-learn
-scipy
+plotly==6.0.1
+scikit-learn==1.6.1
+joblib==1.5.3
+darts[torch]>=0.41.0
