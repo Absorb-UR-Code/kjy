@@ -865,19 +865,20 @@ MODEL_STEP2_FEATURES = ["Is_Unknown_Recipe", "Condition_Zscore", "RealPower"]
 MODEL_PCA_FEATURES = ["PageNo", "Speed", "Length", "RealPower", "SetPower", "GateOnTime", "Condition_Zscore"]
 DEFECT_MODEL_OPTIONS = [
     "SetPower Robust-IQR",
-    "Z-score",
-    "IQR",
-    "Isolation Forest",
-    "One-Class SVM",
-    "LOF",
-    "Isolation Forest - Step1 Feature",
-    "Isolation Forest - Step2 Rule",
-    "Isolation Forest - Step3 Feature",
-    "PCA IF",
-    "PCA OCSVM",
-    "PCA OR 앙상블",
-    "PCA AND 앙상블",
-    "Final Condition Zscore Rule",
+    "IF-SVM AND",
+    "N-Hits",
+]
+NHITS_FEATURES = ["Speed", "Length", "RealPower", "SetPower", "GateOnTime"]
+NHITS_INPUT_CHUNK = 39
+NHITS_EPOCHS = 50
+NHITS_THRESHOLD = 0.016279
+NHITS_MODEL_PATHS = [
+    Path(__file__).with_name("nhits_anomaly_detection.pt"),
+    Path.home() / "Downloads" / "N-HiTS" / "nhits_anomaly_detection.pt",
+]
+NHITS_SCALER_PATHS = [
+    Path(__file__).with_name("nhits_scaler.pkl"),
+    Path.home() / "Downloads" / "N-HiTS" / "nhits_scaler.pkl",
 ]
 
 
@@ -1135,7 +1136,284 @@ def numeric_feature_matrix(df: pd.DataFrame, features: list[str], fill_values=No
     return matrix_df, fill_values
 
 
-def fit_defect_model(model_name: str, train_df: pd.DataFrame, robust_threshold: float = 5.0) -> dict:
+def resolve_existing_path(candidate_paths: list[Path], label: str) -> Path:
+    for path in candidate_paths:
+        if path.exists():
+            return path
+    searched = ", ".join(str(path) for path in candidate_paths)
+    raise FileNotFoundError(f"{label} file was not found. searched: {searched}")
+
+
+def nhits_feature_matrix(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    matrix_df = df.copy()
+    for feature in features:
+        if feature not in matrix_df.columns:
+            matrix_df[feature] = np.nan
+    matrix_df = matrix_df[features].apply(pd.to_numeric, errors="coerce")
+    matrix_df = matrix_df.replace([np.inf, -np.inf], np.nan)
+    return matrix_df.ffill().bfill().fillna(0.0)
+
+
+def darts_values_to_2d(values) -> np.ndarray:
+    if hasattr(values, "values") and callable(getattr(values, "values")):
+        values = values.values()
+
+    if isinstance(values, (list, tuple)):
+        arrays = []
+        for item in values:
+            item_values = item.values() if hasattr(item, "values") and callable(getattr(item, "values")) else item
+            item_array = darts_values_to_2d(item_values)
+            if len(item_array) > 0:
+                arrays.append(item_array[-1:])
+        if not arrays:
+            return np.empty((0, 0))
+        return np.concatenate(arrays, axis=0)
+
+    array = np.asarray(values)
+    if array.ndim == 0:
+        array = array.reshape(1, 1)
+    elif array.ndim == 3:
+        array = array[:, :, 0]
+    elif array.ndim == 1:
+        array = array.reshape(-1, 1)
+    elif array.ndim > 2:
+        array = array.reshape(array.shape[0], -1)
+    return array
+
+
+def update_nhits_progress(progress_state: dict | None, value: float, message: str) -> None:
+    if not progress_state:
+        return
+    value = max(0.0, min(1.0, float(value)))
+    progress_bar = progress_state.get("bar")
+    message_box = progress_state.get("message")
+    if progress_bar is not None:
+        progress_bar.progress(value, text=message)
+    if message_box is not None:
+        message_box.info(message)
+
+
+def make_nhits_epoch_callback(progress_state: dict | None):
+    if not progress_state:
+        return None
+
+    callback_base = None
+    for module_name in ("pytorch_lightning.callbacks", "lightning.pytorch.callbacks"):
+        try:
+            module = __import__(module_name, fromlist=["Callback"])
+            callback_base = module.Callback
+            break
+        except Exception:
+            continue
+
+    if callback_base is None:
+        return None
+
+    total_epochs = int(progress_state.get("epochs", NHITS_EPOCHS))
+
+    class StreamlitNHitsProgressCallback(callback_base):
+        def on_train_epoch_end(self, trainer, pl_module):
+            current_epoch = int(getattr(trainer, "current_epoch", 0)) + 1
+            ratio = min(current_epoch / max(total_epochs, 1), 1.0)
+            update_nhits_progress(
+                progress_state,
+                0.15 + 0.75 * ratio,
+                f"N-Hits 학습 중... {current_epoch}/{total_epochs} epoch",
+            )
+
+    return StreamlitNHitsProgressCallback()
+
+
+def load_nhits_defect_model(train_df: pd.DataFrame, progress_state: dict | None = None) -> dict:
+    try:
+        import joblib
+        from darts import TimeSeries
+        from darts.models import NHiTSModel
+    except Exception as exc:
+        raise ImportError(
+            "N-Hits requires joblib, darts, and torch in the Streamlit Python environment."
+        ) from exc
+
+    model_path = resolve_existing_path(NHITS_MODEL_PATHS, "N-Hits model")
+    scaler_path = resolve_existing_path(NHITS_SCALER_PATHS, "N-Hits scaler")
+    update_nhits_progress(progress_state, 0.03, "N-Hits 모델 파일과 스케일러를 불러오는 중...")
+
+    def make_fresh_model(with_callback: bool = True):
+        trainer_kwargs = {"enable_progress_bar": False, "logger": False}
+        callback = make_nhits_epoch_callback(progress_state) if with_callback else None
+        if callback is not None:
+            trainer_kwargs["callbacks"] = [callback]
+        return NHiTSModel(
+            input_chunk_length=NHITS_INPUT_CHUNK,
+            output_chunk_length=1,
+            num_stacks=3,
+            num_blocks=1,
+            num_layers=2,
+            layer_widths=256,
+            pooling_kernel_sizes=((4,), (2,), (1,)),
+            n_freq_downsample=((4,), (2,), (1,)),
+            dropout=0.1,
+            activation="ReLU",
+            n_epochs=NHITS_EPOCHS,
+            batch_size=32,
+            random_state=42,
+            pl_trainer_kwargs=trainer_kwargs,
+        )
+
+    loaded_model = {
+        "name": "N-Hits",
+        "kind": "nhits",
+        "features": NHITS_FEATURES,
+        "input_chunk": NHITS_INPUT_CHUNK,
+        "threshold": NHITS_THRESHOLD,
+        "model_path": str(model_path),
+        "scaler_path": str(scaler_path),
+        "model": NHiTSModel.load(str(model_path)),
+        "model_factory": make_fresh_model,
+        "plain_model_factory": lambda: make_fresh_model(with_callback=False),
+        "progress_state": progress_state,
+        "scaler": joblib.load(scaler_path),
+        "TimeSeries": TimeSeries,
+    }
+    ensure_nhits_model_fitted(loaded_model, train_df, progress_state=progress_state)
+    loaded_model.pop("model_factory", None)
+    loaded_model.pop("plain_model_factory", None)
+    return loaded_model
+
+
+def make_nhits_time_series(fitted_model: dict, df: pd.DataFrame):
+    features = fitted_model["features"]
+    feature_df = nhits_feature_matrix(df, features)
+    scaled_values = fitted_model["scaler"].transform(feature_df)
+    scaled_df = pd.DataFrame(scaled_values, columns=features)
+    return fitted_model["TimeSeries"].from_dataframe(scaled_df, value_cols=features, freq=1)
+
+
+def ensure_nhits_model_fitted(
+    fitted_model: dict,
+    train_df: pd.DataFrame,
+    progress_state: dict | None = None,
+) -> None:
+    input_chunk = int(fitted_model.get("input_chunk", NHITS_INPUT_CHUNK))
+    if len(train_df) <= input_chunk:
+        raise ValueError(f"N-Hits 학습 데이터는 최소 {input_chunk + 1}행 이상 필요합니다.")
+
+    update_nhits_progress(progress_state, 0.08, "N-Hits 학습 데이터를 시계열로 변환하는 중...")
+    train_series = make_nhits_time_series(fitted_model, train_df)
+    fitted_model["train_series"] = train_series
+
+    if progress_state is not None and fitted_model.get("model_factory") is not None:
+        fitted_model["model"] = fitted_model["model_factory"]()
+
+    update_nhits_progress(progress_state, 0.12, f"N-Hits 딥러닝 학습 시작... 0/{NHITS_EPOCHS} epoch")
+    try:
+        fit_result = fitted_model["model"].fit(train_series, verbose=False)
+    except Exception as exc:
+        message = str(exc).lower()
+        plain_model_factory = fitted_model.get("plain_model_factory")
+        if progress_state is None or plain_model_factory is None or ("callback" not in message and "lightning" not in message):
+            raise
+        update_nhits_progress(progress_state, 0.12, "진행률 콜백 연결 실패로 기본 학습 모드로 재시도 중...")
+        fitted_model["model"] = plain_model_factory()
+        fit_result = fitted_model["model"].fit(train_series, verbose=False)
+
+    if fit_result is not None:
+        fitted_model["model"] = fit_result
+    fitted_model["train_length"] = len(train_df)
+    update_nhits_progress(progress_state, 0.92, "N-Hits 학습 완료 확인 중...")
+
+    try:
+        fitted_model["model"].historical_forecasts(
+            train_series[:input_chunk + 2],
+            start=input_chunk,
+            forecast_horizon=1,
+            stride=1,
+            retrain=False,
+            last_points_only=True,
+            verbose=False,
+        )
+        fitted_model["was_refit"] = True
+    except Exception as exc:
+        message = str(exc)
+        if "has not been fitted" not in message and "call fit()" not in message:
+            raise
+        model_factory = fitted_model.get("model_factory")
+        if model_factory is None:
+            raise
+        update_nhits_progress(progress_state, 0.12, "저장 모델 상태 확인 실패로 새 N-Hits 모델을 학습 중...")
+        fitted_model["model"] = model_factory()
+        fit_result = fitted_model["model"].fit(train_series, verbose=False)
+        if fit_result is not None:
+            fitted_model["model"] = fit_result
+        fitted_model["model"].historical_forecasts(
+            train_series[:input_chunk + 2],
+            start=input_chunk,
+            forecast_horizon=1,
+            stride=1,
+            retrain=False,
+            last_points_only=True,
+            verbose=False,
+        )
+        fitted_model["was_refit"] = True
+    update_nhits_progress(progress_state, 0.95, "N-Hits 학습 확인 완료")
+
+
+def get_nhits_forecast_error(fitted_model: dict, df: pd.DataFrame) -> np.ndarray:
+    input_chunk = int(fitted_model.get("input_chunk", NHITS_INPUT_CHUNK))
+    errors = np.zeros(len(df), dtype=float)
+    if len(df) <= input_chunk:
+        return errors
+
+    progress_state = fitted_model.get("progress_state")
+    update_nhits_progress(progress_state, 0.96, "N-Hits 자동 예측용 시계열을 준비하는 중...")
+    series = make_nhits_time_series(fitted_model, df)
+    try:
+        update_nhits_progress(progress_state, 0.97, "N-Hits 예측 오차를 계산하는 중...")
+        forecasts = fitted_model["model"].historical_forecasts(
+            series,
+            start=input_chunk,
+            forecast_horizon=1,
+            stride=1,
+            retrain=False,
+            last_points_only=True,
+            verbose=False,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if "has not been fitted" not in message and "call fit()" not in message:
+            raise
+        if "train_series" not in fitted_model:
+            raise
+        update_nhits_progress(progress_state, 0.92, "N-Hits 모델 상태를 복구하고 예측을 다시 시도하는 중...")
+        fit_result = fitted_model["model"].fit(fitted_model["train_series"], verbose=False)
+        if fit_result is not None:
+            fitted_model["model"] = fit_result
+        forecasts = fitted_model["model"].historical_forecasts(
+            series,
+            start=input_chunk,
+            forecast_horizon=1,
+            stride=1,
+            retrain=False,
+            last_points_only=True,
+            verbose=False,
+        )
+
+    actual_values = darts_values_to_2d(series[input_chunk:].values())
+    pred_values = darts_values_to_2d(forecasts)
+    valid_count = min(len(actual_values), len(pred_values), len(df) - input_chunk)
+    if valid_count > 0:
+        diff = np.abs(actual_values[:valid_count] - pred_values[:valid_count])
+        errors[input_chunk:input_chunk + valid_count] = np.mean(diff, axis=1)
+    update_nhits_progress(progress_state, 0.99, "N-Hits 예측 결과를 정리하는 중...")
+    return errors
+
+
+def fit_defect_model(
+    model_name: str,
+    train_df: pd.DataFrame,
+    robust_threshold: float = 5.0,
+    progress_state: dict | None = None,
+) -> dict:
     if len(train_df) < 2:
         raise ValueError("학습 데이터가 너무 적습니다. 최소 2행 이상 선택해주세요.")
 
@@ -1147,41 +1425,11 @@ def fit_defect_model(model_name: str, train_df: pd.DataFrame, robust_threshold: 
             "threshold": robust_threshold,
         }
 
-    if model_name == "Final Condition Zscore Rule":
+    if model_name == "IF-SVM AND":
         feature_meta = build_feature_metadata(train_df)
-        return {"name": model_name, "kind": "condition_rule", "feature_meta": feature_meta, "threshold": 10.0}
-
-    feature_meta = build_feature_metadata(train_df)
-    train_features_df = add_engineered_features(train_df, feature_meta)
-
-    if model_name in ["Z-score", "IQR", "Isolation Forest", "One-Class SVM", "LOF"]:
-        features = MODEL_BASE_FEATURES
-    elif model_name == "Isolation Forest - Step1 Feature":
-        features = MODEL_STEP1_FEATURES
-    elif model_name in ["Isolation Forest - Step2 Rule", "Isolation Forest - Step3 Feature"]:
-        features = MODEL_STEP2_FEATURES
-    else:
+        train_features_df = add_engineered_features(train_df, feature_meta)
         features = MODEL_PCA_FEATURES
-
-    X_train, fill_values = numeric_feature_matrix(train_features_df, features)
-
-    if model_name == "Z-score":
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_train)
-        std = X_scaled.std(axis=0)
-        std[std == 0] = 1e-6
-        return {"name": model_name, "kind": "zscore", "features": features, "feature_meta": feature_meta, "fill_values": fill_values, "scaler": scaler, "mean": X_scaled.mean(axis=0), "std": std, "threshold": 3.0}
-
-    if model_name == "IQR":
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_train)
-        q1 = np.percentile(X_scaled, 25, axis=0)
-        q3 = np.percentile(X_scaled, 75, axis=0)
-        iqr = q3 - q1
-        iqr[iqr == 0] = 1e-6
-        return {"name": model_name, "kind": "iqr", "features": features, "feature_meta": feature_meta, "fill_values": fill_values, "scaler": scaler, "q1": q1, "q3": q3, "iqr": iqr, "factor": 1.5}
-
-    if model_name.startswith("PCA "):
+        X_train, fill_values = numeric_feature_matrix(train_features_df, features)
         scaler = StandardScaler()
         Z_train = scaler.fit_transform(X_train)
         pca = PCA(n_components=0.95, random_state=42)
@@ -1203,32 +1451,13 @@ def fit_defect_model(model_name: str, train_df: pd.DataFrame, robust_threshold: 
             "ocsvm": ocsvm,
             "thr_iso": float(np.quantile(iso.score_samples(P_train), alpha)),
             "thr_oc": float(np.quantile(ocsvm.decision_function(P_train), alpha)),
-            "combine": "or" if "OR" in model_name else "and" if "AND" in model_name else "if" if model_name == "PCA IF" else "ocsvm",
+            "combine": "and",
         }
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_train)
+    if model_name == "N-Hits":
+        return load_nhits_defect_model(train_df, progress_state=progress_state)
 
-    if model_name == "One-Class SVM":
-        sample_count = min(len(X_scaled), 15000)
-        sample_idx = np.random.RandomState(42).choice(len(X_scaled), sample_count, replace=False)
-        estimator = OneClassSVM(kernel="rbf", gamma="scale", nu=0.01).fit(X_scaled[sample_idx])
-    elif model_name == "LOF":
-        n_neighbors = max(1, min(20, len(X_scaled) - 1))
-        estimator = LocalOutlierFactor(n_neighbors=n_neighbors, novelty=True).fit(X_scaled)
-    else:
-        contamination = 0.005 if model_name == "Isolation Forest - Step3 Feature" else 0.01
-        estimator = IsolationForest(contamination=contamination, random_state=42).fit(X_scaled)
-
-    return {
-        "name": model_name,
-        "kind": "sklearn_outlier",
-        "features": features,
-        "feature_meta": feature_meta,
-        "fill_values": fill_values,
-        "scaler": scaler,
-        "estimator": estimator,
-    }
+    raise ValueError(f"Unsupported defect model: {model_name}")
 
 
 def predict_defect_model(fitted_model: dict, df: pd.DataFrame, fallback_threshold: float = 5.0) -> pd.DataFrame:
@@ -1237,6 +1466,13 @@ def predict_defect_model(fitted_model: dict, df: pd.DataFrame, fallback_threshol
         return judge_setpower_realpower_improved(fitted_model["model"], df, threshold=model_threshold)
 
     result_df = df.copy()
+
+    if fitted_model["kind"] == "nhits":
+        errors = get_nhits_forecast_error(fitted_model, result_df)
+        pred = (errors > fitted_model.get("threshold", NHITS_THRESHOLD)).astype(int)
+        result_df["model_score"] = errors
+        result_df["pred_label"] = np.asarray(pred, dtype=int)
+        return add_default_prediction_columns(result_df)
 
     if fitted_model["kind"] == "condition_rule":
         feature_df = add_engineered_features(result_df, fitted_model["feature_meta"])
@@ -2732,31 +2968,66 @@ def render_defect_model_tab():
         elif train_defect_groups:
             st.error(f"{', '.join(map(str, train_defect_groups))}번에는 불량 데이터가 포함되어 있습니다.")
         else:
+            nhits_progress_state = None
+            if selected_model_name == "N-Hits":
+                nhits_progress_state = {
+                    "bar": st.progress(0.0, text="N-Hits 학습 준비 중..."),
+                    "message": st.empty(),
+                    "epochs": NHITS_EPOCHS,
+                }
+                update_nhits_progress(nhits_progress_state, 0.01, "N-Hits 학습 준비 중...")
             try:
-                fitted_model = fit_defect_model(selected_model_name, train_df_for_model, robust_threshold=threshold)
+                fitted_model = fit_defect_model(
+                    selected_model_name,
+                    train_df_for_model,
+                    robust_threshold=threshold,
+                    progress_state=nhits_progress_state,
+                )
+            except Exception as exc:
+                if nhits_progress_state is not None:
+                    message_box = nhits_progress_state.get("message")
+                    if message_box is not None:
+                        message_box.error(f"N-Hits 학습 실패: {exc}")
+                st.error(f"학습 실패: {exc}")
+            else:
                 fitted_model["train_groups"] = train_group_ids
                 fitted_model["train_group_text"] = format_group_range_text(train_group_ids)
                 fitted_model["signature"] = f"{selected_model_name}|train={','.join(map(str, train_group_ids))}|ts={time.time():.3f}"
                 st.session_state["trained_defect_model"] = fitted_model
+                if nhits_progress_state is not None:
+                    update_nhits_progress(nhits_progress_state, 0.95, "N-Hits 학습 완료, 자동 예측 준비 중...")
                 st.success(f"{selected_model_name} 학습 완료")
 
                 auto_overlap_groups = sorted(set(train_group_ids).intersection(defect_group_ids))
                 if not defect_group_ids:
+                    if nhits_progress_state is not None:
+                        update_nhits_progress(nhits_progress_state, 1.0, "N-Hits 학습 완료")
                     st.warning("불량이 포함된 그룹이 없어 자동 예측을 진행하지 않았습니다.")
                 elif auto_overlap_groups:
+                    if nhits_progress_state is not None:
+                        update_nhits_progress(nhits_progress_state, 1.0, "N-Hits 학습 완료")
                     st.error(f"{', '.join(map(str, auto_overlap_groups))}번 그룹은 학습 데이터와 예측 데이터가 겹쳐 과적합 위험성이 있습니다. 예측할 수 없습니다.")
                 else:
-                    auto_predict_df = modeling_all_base[modeling_all_base["model_group"].isin(defect_group_ids)].copy()
-                    prediction_result = build_model_prediction_result(fitted_model, auto_predict_df, defect_group_ids)
-                    st.session_state["last_model_prediction"] = prediction_result
-                    append_model_training_history(
-                        fitted_model,
-                        fitted_model["train_group_text"],
-                        prediction_result,
-                    )
-                    st.success("불량 포함 그룹 전체로 자동 예측을 완료했습니다.")
-            except Exception as exc:
-                st.error(f"학습 실패: {exc}")
+                    try:
+                        auto_predict_df = modeling_all_base[modeling_all_base["model_group"].isin(defect_group_ids)].copy()
+                        prediction_result = build_model_prediction_result(fitted_model, auto_predict_df, defect_group_ids)
+                        st.session_state["last_model_prediction"] = prediction_result
+                        append_model_training_history(
+                            fitted_model,
+                            fitted_model["train_group_text"],
+                            prediction_result,
+                        )
+                        if nhits_progress_state is not None:
+                            update_nhits_progress(nhits_progress_state, 1.0, "N-Hits 학습 및 자동 예측 완료")
+                        st.success("불량 포함 그룹 전체로 자동 예측을 완료했습니다.")
+                    except Exception as exc:
+                        if nhits_progress_state is not None:
+                            message_box = nhits_progress_state.get("message")
+                            if message_box is not None:
+                                message_box.error(f"N-Hits 자동 예측 실패: {exc}")
+                        st.error(f"자동 예측 실패: {exc}")
+                if nhits_progress_state is not None:
+                    fitted_model.pop("progress_state", None)
 
     trained_model = st.session_state.get("trained_defect_model")
     if trained_model is not None:
